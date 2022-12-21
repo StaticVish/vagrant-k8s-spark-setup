@@ -1,0 +1,186 @@
+---
+- hosts: all
+  become: true
+  tasks:
+
+    - name: Replace the DNS to 192.168.121.1
+      lineinfile:
+        path: /etc/systemd/resolved.conf
+        regexp: "^DNS="
+        line: "DNS=192.168.121.1"
+        state: present
+        backup: yes
+
+    - name: Restart systemd-resolved.service
+      systemd:
+        state: restarted
+        daemon_reload: yes
+        name: systemd-resolved
+
+    - name: Upgrade all packages to the latest version
+      apt:
+        name: "*"
+        state: latest
+        update_cache: yes
+        force_apt_get: true
+
+    - name: Install packages that allow apt to be used over HTTPS
+      apt:
+        name: "{{ packages }}"
+        state: present
+        update_cache: yes
+      vars:
+        packages:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg-agent
+          - software-properties-common
+
+    # Read device information (always use unit when probing)
+    - parted:
+        device: /dev/vdb
+        unit: KiB
+      register: vdb_info
+
+    # Print the Variable
+    - debug:
+        var: vdb_info
+
+    # Create a New EXT4 File System
+    - name: Create a Data Partition
+      parted:
+        device: /dev/vdb
+        number: 1
+        state: present
+        part_end: "100%"
+
+    # Read the Disk Again
+    - name: Read the Disk Again
+      parted:
+        device: /dev/vdb
+        unit: KiB
+      register: vdb_info
+
+    # Print the Variable
+    - debug:
+        var: vdb_info
+
+    # Create the File System
+    - name: Create the File Systems
+      filesystem:
+        fstype: ext4
+        dev: "/dev/vdb{{ item.num }}"
+      with_items:
+        - "{{ vdb_info.partitions }}"
+
+    # Mount the File System
+    - name: Mount the FileSystem in fstab
+      mount:
+        fstype: ext4
+        src: "/dev/vdb{{ item.num }}"
+        path: "/dbdata"
+        state: mounted
+      with_items:
+        - "{{ vdb_info.partitions }}"
+
+    # Remove Swap
+    - name: Remove swapfile from /etc/fstab
+      mount:
+        name: "{{ item }}"
+        fstype: swap
+        state: absent
+      with_items:
+        - swap
+        - none
+
+    # Disable Swaps
+    - name: Disable swap
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    # Enable sysctl for IP Forwarding
+    - name: Enable ip_forward
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+
+    # Setup Docker
+    - name: Add an apt signing key for Docker
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+    - name: Register lsb_release version
+      shell: lsb_release -cs
+      register: lsb_release
+    - name: Add apt repository for stable version
+      apt_repository:
+        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ lsb_release.stdout }} stable
+        state: present
+    - name: Install docker and its dependecies
+      apt:
+        name: "{{ packages }}"
+        state: present
+        update_cache: yes
+      vars:
+        packages:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - network-manager
+    - name: Set up the Docker daemon
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "exec-opts": ["native.cgroupdriver=systemd"],
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "100m"
+            },
+            "storage-driver": "overlay2"
+          }
+    - name: Make systemd
+      shell: |
+        mkdir -p /etc/systemd/system/docker.service.d
+    - name: Docker Reload and Enable
+      systemd:
+        state: restarted
+        daemon_reload: yes
+        enabled: yes
+        name: docker
+
+    - name: Save the Ip Address of the master
+      shell: |
+        ip -4 addr show eth0 | grep "inet" | head -1 |awk '{print $2}' | cut -d/ -f1
+      register: IPADDRESS
+
+    - name: Save the Hostname for the Master
+      shell: |
+        hostname --fqdn
+      register: HOSTNAME
+
+    - name: Install Docker PIP
+      pip:
+        name: docker-py
+
+    - name: Create a network
+      docker_network:
+        name: dbnet
+
+    - name: Create db container and connect to network
+      docker_container:
+        name: non-performant-search-engine
+        image: postgres:9.6.22-buster
+        state: started
+        volumes:
+          - /dbdata:/var/lib/postgresql/data:rw,Z
+        networks:
+          - name: dbnet
+        ports:
+          - "5432:5432/tcp"
+        env:
+          POSTGRES_PASSWORD: "mysecretpassword"
